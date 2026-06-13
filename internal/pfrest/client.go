@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Package aos is a minimal client for the ArubaOS-Switch (AOS-S) REST API
-// (v8, HTTPS, cookie-based session auth) served by ProVision-era switches
-// such as the 2530 / 2920 / 2930F running WB/YA/YC firmware (16.x).
+// Package pfrest is a minimal client for the pfSense REST API v2 served by the
+// pfSense-pkg-RESTAPI package (https://pfrest.org). Transport is plain HTTPS
+// with a stateless per-request API key (the `X-API-Key` header) — there is no
+// login/session step, unlike cookie- or token-session APIs.
 //
-// AOS-S is NOT ArubaOS-CX: the official aruba/terraform-provider-aoscx targets
-// CX only and does not manage these switches. AOS-S has no Terraform provider
-// upstream, hence this one. The API surface is documented in HPE's "REST API
-// for AOS-S" guides; this client is generic over it (any /rest/v8 path).
+// The API is generic over its surface (any `/api/v2/...` path); this client is
+// the thin transport the generic `pfrest_object` resource is built on. The
+// response is always the envelope {code,status,response_id,message,data,...};
+// callers extract the object(s) from `data`.
 package pfrest
 
 import (
@@ -17,70 +18,72 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
-// Client is a session-authenticated AOS-S REST client. It logs in lazily on
-// the first call and reuses the session cookie; callers may share one Client
-// across resources (the provider does). Safe for concurrent use.
+// Client is a stateless pfSense REST API v2 client. Every request carries the
+// `X-API-Key` header; there is no session to establish or tear down, so one
+// Client is freely shared across resources (the provider does) and is safe for
+// concurrent use (it holds no mutable per-request state).
 type Client struct {
-	base     string // e.g. https://192.168.2.210/rest/v8
-	user     string
-	password string
-	http     *http.Client
-
-	mu     sync.Mutex
-	cookie string // "sessionId=..." once logged in
+	base   string // e.g. https://192.168.7.x/api/v2
+	apiKey string
+	http   *http.Client
 }
 
 // Config configures a Client.
 type Config struct {
-	// Host is the switch address (host or host:port), no scheme.
+	// Host is the pfSense address (host or host:port), no scheme.
 	Host string
-	// Username / Password are the AOS-S operator/manager credentials.
-	Username string
-	Password string
-	// Insecure skips TLS verification (AOS-S ships a self-signed cert; true is
-	// the norm on a lab/OOB management network).
+	// APIKey is a pfSense REST API key (System > REST API > Keys, or POST
+	// /api/v2/auth/key). Sent as the `X-API-Key` header on every request.
+	APIKey string
+	// Insecure skips TLS verification (pfSense ships a self-signed cert; true is
+	// the norm on a lab / OOB management network).
 	Insecure bool
 	// Timeout per request (default 30s).
 	Timeout time.Duration
 }
 
-// NewClient builds a Client. It does not contact the switch until the first
-// API call.
+// NewClient builds a Client. It does not contact pfSense until the first API
+// call.
 func NewClient(c Config) *Client {
 	if c.Timeout == 0 {
 		c.Timeout = 30 * time.Second
 	}
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: c.Insecure}, //nolint:gosec // self-signed mgmt cert
-		// AOS-S serves one session at a time; keep connections lean.
-		MaxIdleConns:    2,
+		MaxIdleConns:    4,
 		IdleConnTimeout: 30 * time.Second,
 	}
 	host := strings.TrimSuffix(strings.TrimPrefix(c.Host, "https://"), "/")
 	host = strings.TrimPrefix(host, "http://")
 	return &Client{
-		base:     fmt.Sprintf("https://%s/rest/v8", host),
-		user:     c.Username,
-		password: c.Password,
-		http:     &http.Client{Timeout: c.Timeout, Transport: tr},
+		base:   fmt.Sprintf("https://%s/api/v2", host),
+		apiKey: c.APIKey,
+		http:   &http.Client{Timeout: c.Timeout, Transport: tr},
 	}
 }
 
-// APIError is returned when the switch responds with a non-2xx status.
+// APIError is returned when pfSense responds with a non-2xx status. Message is
+// the human-readable `message` from the response envelope when present, else
+// the raw body.
 type APIError struct {
-	Method string
-	Path   string
-	Status int
-	Body   string
+	Method  string
+	Path    string
+	Status  int
+	Message string
+	Body    string
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("aos %s %s: HTTP %d: %s", e.Method, e.Path, e.Status, e.Body)
+	msg := e.Message
+	if msg == "" {
+		msg = e.Body
+	}
+	return fmt.Sprintf("pfrest %s %s: HTTP %d: %s", e.Method, e.Path, e.Status, msg)
 }
 
 // NotFound reports whether err is an APIError with a 404 status.
@@ -92,149 +95,99 @@ func NotFound(err error) bool {
 	return ae != nil && ae.Status == http.StatusNotFound
 }
 
-// login establishes a session cookie. Caller must hold c.mu.
-func (c *Client) login() error {
-	body, _ := json.Marshal(map[string]string{"userName": c.user, "password": c.password})
-	req, err := http.NewRequest(http.MethodPost, c.base+"/login-sessions", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("aos login: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode/100 != 2 {
-		return &APIError{Method: "POST", Path: "/login-sessions", Status: resp.StatusCode, Body: string(raw)}
-	}
-	var out struct {
-		Cookie string `json:"cookie"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil || out.Cookie == "" {
-		return fmt.Errorf("aos login: no cookie in response: %s", string(raw))
-	}
-	c.cookie = out.Cookie
-	return nil
+// envelope is the pfSense REST API v2 response wrapper. `data` carries the
+// object (singular endpoint) or array of objects (plural endpoint); it is held
+// raw so callers decide how to interpret it.
+type envelope struct {
+	Code       int             `json:"code"`
+	Status     string          `json:"status"`
+	ReturnID   int             `json:"return"`
+	Message    string          `json:"message"`
+	Data       json.RawMessage `json:"data"`
+	ResponseID string          `json:"response_id"`
 }
 
-// loginRetry logs in, retrying with backoff on HTTP 503 "no free REST sessions"
-// — AOS-S caps concurrent REST sessions very low (≈5), so a slot may need a
-// moment to free (idle sessions time out). Caller must hold c.mu.
-func (c *Client) loginRetry() error {
-	delays := []time.Duration{0, 3 * time.Second, 6 * time.Second, 12 * time.Second, 20 * time.Second, 30 * time.Second}
-	var last error
-	for _, d := range delays {
-		if d > 0 {
-			time.Sleep(d)
-		}
-		err := c.login()
-		if err == nil {
-			return nil
-		}
-		var ae *APIError
-		if e, ok := err.(*APIError); ok {
-			ae = e
-		}
-		if ae == nil || ae.Status != http.StatusServiceUnavailable {
-			return err // not a session-pressure error — fail fast
-		}
-		last = err
+// do performs one authenticated request and returns the parsed envelope on a
+// 2xx, or an APIError otherwise. path is relative to /api/v2 and must start
+// with "/". query is optional (nil for none). body may be nil.
+func (c *Client) do(method, path string, query url.Values, body []byte) (*envelope, error) {
+	u := c.base + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
 	}
-	return fmt.Errorf("aos login: exhausted retries waiting for a free REST session: %w", last)
-}
-
-// logoutLocked tears down the current session. Caller must hold c.mu.
-func (c *Client) logoutLocked() {
-	if c.cookie == "" {
-		return
-	}
-	req, err := http.NewRequest(http.MethodDelete, c.base+"/login-sessions", nil)
-	if err == nil {
-		req.Header.Set("Cookie", c.cookie)
-		if resp, derr := c.http.Do(req); derr == nil {
-			resp.Body.Close()
-		}
-	}
-	c.cookie = ""
-}
-
-// Logout tears down the session. Best-effort; errors are ignored.
-func (c *Client) Logout() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.logoutLocked()
-}
-
-// do performs one authenticated request and ALWAYS releases the session
-// afterwards (login → request → logout, under the mutex). AOS-S allows only a
-// handful of concurrent REST sessions, so holding one across a long Terraform
-// run (or leaking one per run) exhausts the cap; acquiring and releasing per
-// operation keeps at most one session live and never leaks. path is relative to
-// /rest/v8 and must start with "/". body may be nil.
-func (c *Client) do(method, path string, body []byte) ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.loginRetry(); err != nil {
-		return nil, err
-	}
-	defer c.logoutLocked()
-	raw, status, err := c.attempt(method, path, body)
-	if err != nil {
-		return nil, err
-	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		// Session rejected — re-login once and retry.
-		c.cookie = ""
-		if err := c.loginRetry(); err != nil {
-			return nil, err
-		}
-		raw, status, err = c.attempt(method, path, body)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if status/100 != 2 {
-		return nil, &APIError{Method: method, Path: path, Status: status, Body: string(raw)}
-	}
-	return raw, nil
-}
-
-func (c *Client) attempt(method, path string, body []byte) ([]byte, int, error) {
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
 	}
-	req, err := http.NewRequest(method, c.base+path, rdr)
+	req, err := http.NewRequest(method, u, rdr)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	req.Header.Set("Cookie", c.cookie)
+	req.Header.Set("X-API-Key", c.apiKey)
+	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("aos %s %s: %w", method, path, err)
+		return nil, fmt.Errorf("pfrest %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	return raw, resp.StatusCode, nil
+
+	var env envelope
+	// The envelope is always JSON; tolerate a non-JSON body only to surface it
+	// in the error.
+	_ = json.Unmarshal(raw, &env)
+	if resp.StatusCode/100 != 2 {
+		return nil, &APIError{
+			Method:  method,
+			Path:    path,
+			Status:  resp.StatusCode,
+			Message: env.Message,
+			Body:    string(raw),
+		}
+	}
+	return &env, nil
 }
 
-// Get fetches a resource. path is relative to /rest/v8 (must start with "/").
-func (c *Client) Get(path string) ([]byte, error) { return c.do(http.MethodGet, path, nil) }
-
-// Put upserts a resource with the given JSON body.
-func (c *Client) Put(path string, body []byte) ([]byte, error) {
-	return c.do(http.MethodPut, path, body)
+// Get fetches a resource. query carries the id for singular collection items
+// (e.g. id=3); nil for singletons and plural list endpoints. Returns the raw
+// `data` field of the envelope.
+func (c *Client) Get(path string, query url.Values) (json.RawMessage, error) {
+	env, err := c.do(http.MethodGet, path, query, nil)
+	if err != nil {
+		return nil, err
+	}
+	return env.Data, nil
 }
 
-// Post creates a resource in a collection with the given JSON body.
-func (c *Client) Post(path string, body []byte) ([]byte, error) {
-	return c.do(http.MethodPost, path, body)
+// Post creates an object in a collection with the given JSON body. Returns the
+// raw `data` of the created object (which includes the server-assigned `id`).
+func (c *Client) Post(path string, body []byte) (json.RawMessage, error) {
+	env, err := c.do(http.MethodPost, path, nil, body)
+	if err != nil {
+		return nil, err
+	}
+	return env.Data, nil
 }
 
-// Delete removes a resource.
-func (c *Client) Delete(path string) ([]byte, error) { return c.do(http.MethodDelete, path, nil) }
+// Patch updates an object (singular collection item or singleton) with the
+// given JSON body. For a collection item the id must be carried inside body
+// (the pfSense convention) and/or in query. Returns the raw `data`.
+func (c *Client) Patch(path string, query url.Values, body []byte) (json.RawMessage, error) {
+	env, err := c.do(http.MethodPatch, path, query, body)
+	if err != nil {
+		return nil, err
+	}
+	return env.Data, nil
+}
+
+// Delete removes a collection object addressed by query (id=N).
+func (c *Client) Delete(path string, query url.Values) (json.RawMessage, error) {
+	env, err := c.do(http.MethodDelete, path, query, nil)
+	if err != nil {
+		return nil, err
+	}
+	return env.Data, nil
+}

@@ -1,42 +1,44 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# terraform-provider-aruba-aos
+# terraform-provider-pfrest
 
-A native OpenTofu/Terraform provider for **ArubaOS-Switch (AOS-S)** switches —
-the ProVision/ProCurve-lineage 2530 / 2920 / 2930F running 16.x firmware — via
-the **REST API v8** (HTTPS, cookie-session auth).
-
-> **Not ArubaOS-CX.** The official `aruba/terraform-provider-aoscx` targets the
-> newer AOS-CX line (6300/8320/…) and does **not** manage AOS-S switches. AOS-S
-> has no upstream provider; this fills that gap. If you have a CX switch, use
-> the official one.
+A native OpenTofu/Terraform provider for **pfSense** via the **REST API v2**
+served by the [`pfSense-pkg-RESTAPI`](https://pfrest.org) package
+(`pfrest/pfSense-pkg-RESTAPI`). Transport is plain HTTPS with a stateless
+`X-API-Key` header — no login/session step.
 
 ## Why generic
 
-AOS-S exposes a broad, stable REST surface (`/rest/v8/...`): singletons
-(`system`, `stp`, `dns`, `lldp`, `snmp-server`, `syslog`) and collections
-(`vlans/{vid}`, `vlans-ports/{vid}-{port}`, `ports/{id}`,
-`snmp-server/communities/{name}`, `stp/ports/{id}`, …). Rather than hand-code a
-resource per feature (and chase firmware additions forever), this provider is
-**generic over the API** — one resource and one data source address *any* path.
-That is **100% feature coverage** by construction.
+The pfSense REST API exposes a broad, stable surface under `/api/v2/...`:
+collections where the server assigns an `id` on create (`firewall/alias`,
+`firewall/rule`, `interface/vlan`, `routing/gateway`, …) and singletons updated
+in place (`system/dns`, `system/hostname`, `system/tunable`, …). Rather than
+hand-code a resource per feature (and chase package additions forever), this
+provider is **generic over the API** — one resource and one data source address
+*any* endpoint. That is **100% feature coverage** by construction.
 
 ## Resources
 
-### `arubaos_object` (resource)
+### `pfrest_object` (resource)
 
-CRUD + `ImportState` for any addressable AOS-S resource.
+CRUD + `ImportState` for any addressable pfSense REST resource.
 
 ```hcl
-resource "arubaos_object" "vlan_iot" {
-  path        = "vlans/40"   # GET/PUT/DELETE target
-  create_path = "vlans"      # POST here on create (omit to create via PUT path)
-  body        = jsonencode({ vlan_id = 40, name = "IOT" })
+# Collection item — POST creates, server assigns id; GET/PATCH/DELETE use ?id=
+resource "pfrest_object" "lab_hosts" {
+  endpoint = "firewall/alias"
+  body = jsonencode({
+    name  = "lab_hosts"
+    type  = "host"
+    descr = "managed by tofu"
+    address = ["10.0.0.10", "10.0.0.11"]
+  })
 }
 
-resource "arubaos_object" "system" {
-  path          = "system"
-  delete_method = "NONE"     # singleton — cannot be deleted
-  body          = jsonencode({ name = "house-aruba-2530" })
+# Singleton — PATCHed in place, no create/delete
+resource "pfrest_object" "dns" {
+  endpoint  = "system/dns"
+  singleton = true
+  body      = jsonencode({ dnsserver = ["1.1.1.1", "8.8.8.8"] })
 }
 ```
 
@@ -45,22 +47,30 @@ manage. State holds the full device object; a plan modifier suppresses the diff
 when every declared key already matches the device, so:
 
 - importing an existing resource (`tofu import` / `import {}` block) lands at
-  **0-diff** with no apply against the switch, and
+  **0-diff** with no apply against the firewall, and
 - the provider never clobbers device fields you didn't declare.
 
 | Attribute | | Meaning |
 |-----------|---|---------|
-| `path` | required, ForceNew | addressed path under `/rest/v8` (leading slash optional) |
+| `endpoint` | required, ForceNew | the `/api/v2` path (leading slash optional), e.g. `firewall/alias`, `system/dns` |
 | `body` | required | JSON object of the keys you manage |
-| `create_path` | optional, ForceNew | collection to `POST` to on create; omit → create via idempotent `PUT path` |
-| `delete_method` | optional | `DELETE` (default), `PUT` (send `delete_body` — reset a singleton), or `NONE` |
-| `delete_body` | optional | reset body for `delete_method = "PUT"` |
-| `id` | computed | equals `path` |
+| `singleton` | optional, ForceNew | `true` for in-place PATCH endpoints (no create/delete); default `false` (collection) |
+| `object_id` | computed | the pfSense-assigned `id` for a collection item |
+| `id` | computed | `<endpoint>` (singleton) or `<endpoint>\|<object_id>` (collection) |
 
-### `arubaos_object` (data source)
+### `pfrest_object` (data source)
 
 ```hcl
-data "arubaos_object" "vlans" { path = "vlans" }   # .response is raw JSON
+data "pfrest_object" "aliases" { endpoint = "firewall/aliases" }       # plural list -> .response is a JSON array
+data "pfrest_object" "alias3"  { endpoint = "firewall/alias"  object_id = "3" }  # single item via ?id=
+data "pfrest_object" "dns"     { endpoint = "system/dns" }             # singleton
+```
+
+## Import ids
+
+```sh
+tofu import pfrest_object.dns        'system/dns'        # singleton
+tofu import pfrest_object.lab_hosts  'firewall/alias|3'  # collection item id 3
 ```
 
 ## Provider configuration
@@ -68,28 +78,29 @@ data "arubaos_object" "vlans" { path = "vlans" }   # .response is raw JSON
 ```hcl
 terraform {
   required_providers {
-    arubaos = { source = "registry.terraform.io/jamesonrgrieve/aruba-aos" }
+    pfrest = { source = "registry.terraform.io/jamesonrgrieve/pfrest" }
   }
 }
 
-provider "arubaos" {
-  host     = "192.168.2.210"     # no scheme
-  username = var.switch_user
-  password = var.switch_password # sensitive
-  insecure = true                # AOS-S self-signed cert (default true)
+provider "pfrest" {
+  host     = "192.168.7.10"        # no scheme
+  api_key  = var.pfsense_api_key   # sensitive; sent as X-API-Key
+  insecure = true                  # pfSense self-signed cert (default true)
 }
 ```
+
+Generate an API key in **System > REST API > Keys**, or `POST /api/v2/auth/key`.
 
 ## Local build / dev install
 
 ```sh
-make build          # -> terraform-provider-aruba-aos
+make build          # -> terraform-provider-pfrest
 make install        # installs to $DEV_BIN_DIR for a dev_overrides .tfrc
 make check          # tidy + fmt + vet + test + build (pre-commit / CI gate)
 ```
 
 For runners without registry access, install into a filesystem mirror:
-`<plugins>/registry.terraform.io/JamesonRGrieve/tofu-aruba-aos/<ver>/<os>_<arch>/terraform-provider-aruba-aos`
+`<plugins>/registry.terraform.io/JamesonRGrieve/pfrest/<ver>/<os>_<arch>/terraform-provider-pfrest`
 and point a `.terraformrc` `provider_installation { filesystem_mirror {...} }` at it.
 
 ## License

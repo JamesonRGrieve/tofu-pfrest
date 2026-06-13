@@ -2,7 +2,10 @@
 
 package provider
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestSubsetMatches(t *testing.T) {
 	cases := []struct {
@@ -12,45 +15,51 @@ func TestSubsetMatches(t *testing.T) {
 	}{
 		{
 			name:        "config subset of full device object — match (0-diff)",
-			prior:       `{"vlan_id":40,"name":"IOT","uri":"/vlans/40","type":"VT_STATIC","is_voice_enabled":false}`,
-			cfg:         `{"vlan_id":40,"name":"IOT"}`,
+			prior:       `{"id":3,"name":"web_servers","type":"host","descr":"","address":["10.0.0.1"]}`,
+			cfg:         `{"name":"web_servers","type":"host","address":["10.0.0.1"]}`,
 			wantMatched: true,
 		},
 		{
 			name:        "declared key drifted — no match (update)",
-			prior:       `{"vlan_id":40,"name":"IOT-OLD","uri":"/vlans/40"}`,
-			cfg:         `{"vlan_id":40,"name":"IOT"}`,
+			prior:       `{"id":3,"name":"web_servers_OLD","type":"host"}`,
+			cfg:         `{"name":"web_servers","type":"host"}`,
 			wantMatched: false,
 		},
 		{
 			name:        "declared key missing on device — no match",
-			prior:       `{"vlan_id":40,"uri":"/vlans/40"}`,
-			cfg:         `{"vlan_id":40,"name":"IOT"}`,
+			prior:       `{"id":3,"type":"host"}`,
+			cfg:         `{"name":"web_servers","type":"host"}`,
 			wantMatched: false,
 		},
 		{
 			name:        "key order / whitespace insensitive — match",
-			prior:       `{"name":"IOT","vlan_id":40}`,
-			cfg:         "{\n  \"vlan_id\": 40,\n  \"name\": \"IOT\"\n}",
+			prior:       `{"name":"web_servers","type":"host"}`,
+			cfg:         "{\n  \"type\": \"host\",\n  \"name\": \"web_servers\"\n}",
 			wantMatched: true,
 		},
 		{
 			name:        "nested object value compared structurally — match",
-			prior:       `{"default_gateway":{"version":"IAV_IP_V4","octets":"192.168.2.1"},"name":"sw"}`,
-			cfg:         `{"default_gateway":{"octets":"192.168.2.1","version":"IAV_IP_V4"}}`,
+			prior:       `{"dnsserver":{"v4":"1.1.1.1","v6":"::1"},"id":0}`,
+			cfg:         `{"dnsserver":{"v6":"::1","v4":"1.1.1.1"}}`,
 			wantMatched: true,
 		},
 		{
 			name:        "nested object value drift — no match",
-			prior:       `{"default_gateway":{"version":"IAV_IP_V4","octets":"192.168.2.1"}}`,
-			cfg:         `{"default_gateway":{"version":"IAV_IP_V4","octets":"192.168.2.254"}}`,
+			prior:       `{"dnsserver":{"v4":"1.1.1.1"}}`,
+			cfg:         `{"dnsserver":{"v4":"8.8.8.8"}}`,
 			wantMatched: false,
 		},
 		{
 			name:        "list value compared in order — match",
-			prior:       `{"tagged":[40,50,58,82],"id":"Trk1"}`,
-			cfg:         `{"tagged":[40,50,58,82]}`,
+			prior:       `{"address":["10.0.0.1","10.0.0.2"],"id":1}`,
+			cfg:         `{"address":["10.0.0.1","10.0.0.2"]}`,
 			wantMatched: true,
+		},
+		{
+			name:        "list order drift — no match",
+			prior:       `{"address":["10.0.0.2","10.0.0.1"]}`,
+			cfg:         `{"address":["10.0.0.1","10.0.0.2"]}`,
+			wantMatched: false,
 		},
 		{
 			name:        "invalid prior JSON — no match (fall back to diff)",
@@ -70,10 +79,10 @@ func TestSubsetMatches(t *testing.T) {
 
 func TestNormPath(t *testing.T) {
 	for in, want := range map[string]string{
-		"vlans/40":  "/vlans/40",
-		"/vlans/40": "/vlans/40",
-		" system ":  "/system",
-		"/system":   "/system",
+		"firewall/alias":  "/firewall/alias",
+		"/firewall/alias": "/firewall/alias",
+		" system/dns ":    "/system/dns",
+		"/system/dns":     "/system/dns",
 	} {
 		if got := normPath(in); got != want {
 			t.Errorf("normPath(%q) = %q, want %q", in, got, want)
@@ -81,17 +90,70 @@ func TestNormPath(t *testing.T) {
 	}
 }
 
-func TestParentCollection(t *testing.T) {
-	for in, want := range map[string]string{
-		"/vlans-ports/58-41":               "/vlans-ports",
-		"/vlans/58":                        "/vlans",
-		"/vlans/81/ipaddresses/IAAM-1.2.3": "/vlans/81/ipaddresses",
-		"/stp":                             "",
-		"/system":                          "",
-	} {
-		if got := parentCollection(in); got != want {
-			t.Errorf("parentCollection(%q) = %q, want %q", in, got, want)
-		}
+func TestExtractID(t *testing.T) {
+	cases := []struct {
+		name   string
+		data   string
+		wantID string
+		wantOK bool
+	}{
+		{name: "integer id (most collections)", data: `{"id":3,"name":"a"}`, wantID: "3", wantOK: true},
+		{name: "zero id", data: `{"id":0,"name":"a"}`, wantID: "0", wantOK: true},
+		{name: "string id", data: `{"id":"wan","descr":"x"}`, wantID: "wan", wantOK: true},
+		{name: "no id field", data: `{"name":"a"}`, wantID: "", wantOK: false},
+		{name: "invalid json", data: `nope`, wantID: "", wantOK: false},
+		{name: "array (not an object)", data: `[1,2]`, wantID: "", wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, ok := extractID(json.RawMessage(tc.data))
+			if ok != tc.wantOK || id != tc.wantID {
+				t.Fatalf("extractID(%s) = (%q,%v), want (%q,%v)", tc.data, id, ok, tc.wantID, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestWithID(t *testing.T) {
+	// Integer id is injected as a JSON number.
+	out, err := withID([]byte(`{"name":"a"}`), "3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := m["id"].(float64); !ok || int(n) != 3 {
+		t.Fatalf("withID numeric id: got %#v", m["id"])
+	}
+	if m["name"] != "a" {
+		t.Fatalf("withID dropped a field: %#v", m)
+	}
+
+	// Non-integer id is injected as a JSON string.
+	out, err = withID([]byte(`{"descr":"x"}`), "wan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = nil
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := m["id"].(string); !ok || s != "wan" {
+		t.Fatalf("withID string id: got %#v", m["id"])
+	}
+
+	// Invalid body is an error.
+	if _, err := withID([]byte(`not json`), "1"); err == nil {
+		t.Fatal("withID(invalid body) expected error")
+	}
+}
+
+func TestIDQuery(t *testing.T) {
+	q := idQuery("3")
+	if got := q.Encode(); got != "id=3" {
+		t.Fatalf("idQuery(3).Encode() = %q, want %q", got, "id=3")
 	}
 }
 

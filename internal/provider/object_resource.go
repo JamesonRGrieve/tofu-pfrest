@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"reflect"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -24,21 +26,20 @@ var (
 	_ resource.ResourceWithImportState = (*objectResource)(nil)
 )
 
-// NewObjectResource constructs the generic aruba_aos_object resource.
+// NewObjectResource constructs the generic pfrest_object resource.
 func NewObjectResource() resource.Resource { return &objectResource{} }
 
 type objectResource struct {
 	client *pfrest.Client
 }
 
-// objectModel is the state/plan shape for aruba_aos_object.
+// objectModel is the state/plan shape for pfrest_object.
 type objectModel struct {
-	ID           types.String `tfsdk:"id"`
-	Path         types.String `tfsdk:"path"`
-	CreatePath   types.String `tfsdk:"create_path"`
-	DeleteMethod types.String `tfsdk:"delete_method"`
-	DeleteBody   types.String `tfsdk:"delete_body"`
-	Body         types.String `tfsdk:"body"`
+	ID        types.String `tfsdk:"id"`
+	Endpoint  types.String `tfsdk:"endpoint"`
+	Singleton types.Bool   `tfsdk:"singleton"`
+	ObjectID  types.String `tfsdk:"object_id"`
+	Body      types.String `tfsdk:"body"`
 }
 
 func (r *objectResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -47,38 +48,38 @@ func (r *objectResource) Metadata(_ context.Context, req resource.MetadataReques
 
 func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A generic ArubaOS-Switch REST resource addressed by its `/rest/v8` path. " +
-			"Covers 100% of the AOS-S API: any singleton (`system`, `stp`, `dns`, `lldp`) or " +
-			"collection item (`vlans/40`, `vlans-ports/40-3`, `ports/5`, `snmp-server/communities/public`). " +
+		MarkdownDescription: "A generic pfSense REST API v2 resource addressed by its `/api/v2` endpoint path. " +
+			"Covers 100% of the pfSense REST API: any collection item (`firewall/alias`, " +
+			"`firewall/rule`, `interface/vlan`, …) where the server assigns an `id` on POST, or any " +
+			"singleton (`system/dns`, `system/hostname`, …) updated in place with PATCH. " +
 			"`body` declares only the keys this resource manages; device-returned keys outside `body` are " +
 			"ignored for drift, so a subset declaration imports to 0-diff and never clobbers unmanaged fields.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "Resource id — equal to `path`.",
+				MarkdownDescription: "Resource id — `<endpoint>` for singletons, `<endpoint>|<object_id>` for collection items.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
-			"path": schema.StringAttribute{
+			"endpoint": schema.StringAttribute{
 				Required: true,
-				MarkdownDescription: "Addressed resource path under `/rest/v8` (leading slash optional), " +
-					"used for GET/PUT/DELETE. E.g. `vlans/40`, `system`, `vlans-ports/40-3`.",
+				MarkdownDescription: "The `/api/v2` path of the resource (leading slash optional), e.g. " +
+					"`firewall/alias`, `firewall/rule`, `system/dns`. ForceNew.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
-			"create_path": schema.StringAttribute{
+			"singleton": schema.BoolAttribute{
 				Optional: true,
-				MarkdownDescription: "Collection path to POST to on create (e.g. `vlans` while `path` is `vlans/40`). " +
-					"When unset, create is an idempotent PUT to `path`. Carry it in the import id " +
-					"(`<path>|<create_path>`) so an imported resource matches config and lands at 0-diff.",
+				Computed: true,
+				MarkdownDescription: "Whether `endpoint` is a singleton (PATCHed in place, no create/delete, e.g. " +
+					"`system/dns`) rather than a collection item (POST creates, server assigns `id`; " +
+					"GET/PATCH/DELETE address by `?id=`). Default `false` (collection). ForceNew.",
+				Default:       booldefault.StaticBool(false),
+				PlanModifiers: []planmodifier.Bool{requiresReplaceBool{}},
 			},
-			"delete_method": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "How to destroy: `DELETE` (default), `PUT` (send `delete_body` to `path` — " +
-					"reset a singleton to default), or `NONE` (no-op for un-deletable singletons). Carry it in the " +
-					"import id (`<path>|<create_path>|<delete_method>`) to match config.",
-			},
-			"delete_body": schema.StringAttribute{
-				Optional:            true,
-				MarkdownDescription: "JSON body PUT to `path` on destroy when `delete_method = \"PUT\"`. Import id field 4.",
+			"object_id": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "The pfSense-assigned object id for a collection item, captured from `data.id` " +
+					"on create. Empty for singletons.",
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"body": schema.StringAttribute{
 				Required: true,
@@ -103,7 +104,7 @@ func (r *objectResource) Configure(_ context.Context, req resource.ConfigureRequ
 	r.client = client
 }
 
-// normPath ensures a leading slash.
+// normPath ensures a leading slash and trims surrounding whitespace.
 func normPath(p string) string {
 	p = strings.TrimSpace(p)
 	if !strings.HasPrefix(p, "/") {
@@ -112,15 +113,42 @@ func normPath(p string) string {
 	return p
 }
 
-// parentCollection returns the collection path for an item path by dropping the
-// last segment: "/vlans-ports/58-41" -> "/vlans-ports", "/vlans/58" -> "/vlans".
-// Returns "" for a top-level singleton (no parent).
-func parentCollection(p string) string {
-	i := strings.LastIndex(p, "/")
-	if i <= 0 {
-		return ""
+// idQuery builds the `?id=<id>` query the pfSense REST API uses to address a
+// single collection item.
+func idQuery(id string) url.Values {
+	return url.Values{"id": []string{id}}
+}
+
+// extractID pulls the server-assigned id from a created/returned object's raw
+// `data`. pfSense returns the full object including its `id` field (a number
+// for most collections, a string for a few). It is rendered back to a string
+// for state.
+func extractID(data json.RawMessage) (string, bool) {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) != nil {
+		return "", false
 	}
-	return p[:i]
+	raw, ok := obj["id"]
+	if !ok {
+		return "", false
+	}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return "", false
+	}
+	switch n := v.(type) {
+	case float64:
+		// Integer ids: render without a trailing ".0".
+		return fmt.Sprintf("%d", int64(n)), true
+	case string:
+		return n, true
+	default:
+		return strings.Trim(string(raw), `"`), true
+	}
+}
+
+func (r *objectResource) isSingleton(m objectModel) bool {
+	return !m.Singleton.IsNull() && !m.Singleton.IsUnknown() && m.Singleton.ValueBool()
 }
 
 func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -134,31 +162,38 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
 		return
 	}
-	var err error
-	if !m.CreatePath.IsNull() && m.CreatePath.ValueString() != "" {
-		// Explicit collection POST (e.g. /vlans).
-		_, err = r.client.Post(normPath(m.CreatePath.ValueString()), body)
-	} else {
-		// Idempotent PUT to the item path; if the item doesn't exist yet
-		// (AOS-S replies 404 to PUT on a not-yet-present collection item, e.g.
-		// a new vlans-ports membership), fall back to POSTing the parent
-		// collection. This makes the generic resource handle both upsert-PUT
-		// singletons and POST-create collections without an explicit create_path.
-		p := normPath(m.Path.ValueString())
-		_, err = r.client.Put(p, body)
-		if err != nil && pfrest.NotFound(err) {
-			if parent := parentCollection(p); parent != "" {
-				_, err = r.client.Post(parent, body)
-			}
+	endpoint := normPath(m.Endpoint.ValueString())
+
+	if r.isSingleton(m) {
+		// Singleton: there is nothing to create — PATCH the endpoint into the
+		// declared shape. The endpoint is the id; no object_id.
+		if _, err := r.client.Patch(endpoint, nil, body); err != nil {
+			resp.Diagnostics.AddError("pfrest create (singleton PATCH) failed", err.Error())
+			return
 		}
-	}
-	if err != nil {
-		resp.Diagnostics.AddError("AOS-S create failed", err.Error())
+		m.ObjectID = types.StringValue("")
+		m.ID = m.Endpoint
+		resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 		return
 	}
-	m.ID = m.Path
-	// Store the declared body verbatim so the create plan/state are consistent;
-	// the next refresh (Read) replaces it with the full device object.
+
+	// Collection: POST creates the object and the server assigns the id, which
+	// it returns in data.id.
+	data, err := r.client.Post(endpoint, body)
+	if err != nil {
+		resp.Diagnostics.AddError("pfrest create (POST) failed", err.Error())
+		return
+	}
+	id, ok := extractID(data)
+	if !ok {
+		resp.Diagnostics.AddError("pfrest create: no id in response",
+			fmt.Sprintf("POST %s returned no `data.id`: %s", endpoint, string(data)))
+		return
+	}
+	m.ObjectID = types.StringValue(id)
+	m.ID = types.StringValue(m.Endpoint.ValueString() + "|" + id)
+	// Store the declared body verbatim; the next refresh (Read) replaces it with
+	// the full device object.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -168,24 +203,34 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	raw, err := r.client.Get(normPath(m.Path.ValueString()))
+	endpoint := normPath(m.Endpoint.ValueString())
+	var query url.Values
+	if !r.isSingleton(m) {
+		query = idQuery(m.ObjectID.ValueString())
+	}
+	data, err := r.client.Get(endpoint, query)
 	if err != nil {
 		if pfrest.NotFound(err) {
 			resp.State.RemoveResource(ctx)
 			return
 		}
-		resp.Diagnostics.AddError("AOS-S read failed", err.Error())
+		resp.Diagnostics.AddError("pfrest read failed", err.Error())
 		return
 	}
 	// Store the full device object (compacted). The subset plan modifier
 	// reconciles it against the declared config body at plan time.
-	compact, err := compactJSON(raw)
+	compact, err := compactJSON(data)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read: invalid JSON from device", err.Error())
+		resp.Diagnostics.AddError("pfrest read: invalid JSON from device", err.Error())
 		return
 	}
 	m.Body = types.StringValue(compact)
-	m.ID = m.Path
+	if r.isSingleton(m) {
+		m.ObjectID = types.StringValue("")
+		m.ID = m.Endpoint
+	} else {
+		m.ID = types.StringValue(m.Endpoint.ValueString() + "|" + m.ObjectID.ValueString())
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -195,16 +240,45 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	// object_id is computed and carried across an update; pull it from prior state.
+	var prior objectModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	m.ObjectID = prior.ObjectID
+
 	body := []byte(m.Body.ValueString())
 	if !json.Valid(body) {
 		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
 		return
 	}
-	if _, err := r.client.Put(normPath(m.Path.ValueString()), body); err != nil {
-		resp.Diagnostics.AddError("AOS-S update failed", err.Error())
+	endpoint := normPath(m.Endpoint.ValueString())
+
+	if r.isSingleton(m) {
+		if _, err := r.client.Patch(endpoint, nil, body); err != nil {
+			resp.Diagnostics.AddError("pfrest update (singleton PATCH) failed", err.Error())
+			return
+		}
+		m.ID = m.Endpoint
+		resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 		return
 	}
-	m.ID = m.Path
+
+	// Collection: PATCH the endpoint with body + {id: object_id}. pfSense
+	// addresses the PATCH target by the `id` field in the body; we also send it
+	// as a query param for robustness.
+	id := m.ObjectID.ValueString()
+	patchBody, err := withID(body, id)
+	if err != nil {
+		resp.Diagnostics.AddError("pfrest update: cannot inject id", err.Error())
+		return
+	}
+	if _, err := r.client.Patch(endpoint, idQuery(id), patchBody); err != nil {
+		resp.Diagnostics.AddError("pfrest update (PATCH) failed", err.Error())
+		return
+	}
+	m.ID = types.StringValue(m.Endpoint.ValueString() + "|" + id)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -214,50 +288,90 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	method := "DELETE"
-	if !m.DeleteMethod.IsNull() && m.DeleteMethod.ValueString() != "" {
-		method = strings.ToUpper(m.DeleteMethod.ValueString())
+	if r.isSingleton(m) {
+		// Singletons cannot be deleted — just drop from state.
+		return
 	}
-	var err error
-	switch method {
-	case "NONE":
-		// Singleton that cannot be deleted (e.g. /system); just drop from state.
-	case "PUT":
-		if m.DeleteBody.IsNull() {
-			resp.Diagnostics.AddError("delete_method=PUT requires delete_body", "no reset body provided")
-			return
+	endpoint := normPath(m.Endpoint.ValueString())
+	if _, err := r.client.Delete(endpoint, idQuery(m.ObjectID.ValueString())); err != nil {
+		if pfrest.NotFound(err) {
+			return // already gone
 		}
-		_, err = r.client.Put(normPath(m.Path.ValueString()), []byte(m.DeleteBody.ValueString()))
-	default: // DELETE
-		_, err = r.client.Delete(normPath(m.Path.ValueString()))
-		if err != nil && pfrest.NotFound(err) {
-			err = nil // already gone
-		}
-	}
-	if err != nil {
-		resp.Diagnostics.AddError("AOS-S delete failed", err.Error())
+		resp.Diagnostics.AddError("pfrest delete failed", err.Error())
 	}
 }
 
 func (r *objectResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Import id is a pipe-delimited tuple so the imported state matches the
-	// config's operational hints exactly (→ 0-diff, no spurious update/replace):
-	//   <path>[|<create_path>[|<delete_method>[|<delete_body>]]]
-	// Empty fields are treated as null. Body is populated on the following Read.
-	parts := strings.Split(req.ID, "|")
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("path"), parts[0])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), parts[0])...)
-	setOpt := func(p string, i int) {
-		if i < len(parts) && parts[i] != "" {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), parts[i])...)
-		} else {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), types.StringNull())...)
-		}
-	}
-	setOpt("create_path", 1)
-	setOpt("delete_method", 2)
-	setOpt("delete_body", 3)
+	// Import id forms (body is populated on the following Read):
+	//   <endpoint>             — singleton (e.g. "system/dns")
+	//   <endpoint>|<object_id> — collection item (e.g. "firewall/alias|3")
+	parts := strings.SplitN(req.ID, "|", 2)
+	endpoint := parts[0]
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("endpoint"), endpoint)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("body"), "{}")...)
+	if len(parts) == 2 && parts[1] != "" {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("singleton"), false)...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("object_id"), parts[1])...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
+		return
+	}
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("singleton"), true)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("object_id"), "")...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), endpoint)...)
+}
+
+// withID returns the JSON body with an "id" key set to id (numeric if id parses
+// as an integer, else string). The pfSense PATCH convention identifies the
+// target collection item by the `id` field in the request body.
+func withID(body []byte, id string) ([]byte, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, err
+	}
+	obj["id"] = idJSON(id)
+	return json.Marshal(obj)
+}
+
+// idJSON renders id as a JSON number when it is an integer, else as a JSON
+// string — matching how pfSense types collection ids.
+func idJSON(id string) json.RawMessage {
+	if _, err := jsonInt(id); err == nil {
+		return json.RawMessage(id)
+	}
+	b, _ := json.Marshal(id)
+	return b
+}
+
+func jsonInt(s string) (int64, error) {
+	var n int64
+	// json.Unmarshal validates integer-ness without locale surprises.
+	if err := json.Unmarshal([]byte(s), &n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ---------------------------------------------------------------------------
+// requiresReplaceBool — RequiresReplace for the `singleton` bool. (The bool
+// plan-modifier package's RequiresReplace exists, but reimplementing the tiny
+// piece keeps the dependency surface identical to the reference provider.)
+// ---------------------------------------------------------------------------
+
+type requiresReplaceBool struct{}
+
+func (requiresReplaceBool) Description(context.Context) string {
+	return "Changing this attribute forces resource replacement."
+}
+func (requiresReplaceBool) MarkdownDescription(context.Context) string {
+	return (requiresReplaceBool{}).Description(nil)
+}
+func (requiresReplaceBool) PlanModifyBool(_ context.Context, req planmodifier.BoolRequest, resp *planmodifier.BoolResponse) {
+	if req.StateValue.IsNull() || req.PlanValue.IsNull() || req.PlanValue.IsUnknown() {
+		return
+	}
+	if !req.StateValue.Equal(req.PlanValue) {
+		resp.RequiresReplace = true
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Package provider implements the aruba-aos OpenTofu/Terraform provider — a
-// native client for the ArubaOS-Switch (AOS-S) REST API v8. It is generic over
-// the API surface (the aruba_aos_object resource/data source address any
-// /rest/v8 path), giving 100% feature coverage without per-feature code.
+// Package provider implements the pfrest OpenTofu/Terraform provider — a native
+// client for the pfSense REST API v2 (pfSense-pkg-RESTAPI, https://pfrest.org).
+// It is generic over the API surface (the pfrest_object resource/data source
+// address any /api/v2 endpoint), giving 100% feature coverage without
+// per-feature code.
 package provider
 
 import (
@@ -17,25 +18,24 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-var _ provider.Provider = (*aosProvider)(nil)
+var _ provider.Provider = (*pfrestProvider)(nil)
 
 // New returns the provider factory for a given version.
 func New(version string) func() provider.Provider {
-	return func() provider.Provider { return &aosProvider{version: version} }
+	return func() provider.Provider { return &pfrestProvider{version: version} }
 }
 
-type aosProvider struct {
+type pfrestProvider struct {
 	version string
 }
 
 type providerModel struct {
 	Host     types.String `tfsdk:"host"`
-	Username types.String `tfsdk:"username"`
-	Password types.String `tfsdk:"password"`
+	APIKey   types.String `tfsdk:"api_key"`
 	Insecure types.Bool   `tfsdk:"insecure"`
 }
 
-func (p *aosProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
+func (p *pfrestProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
 	// Single-token type name -> resources are `pfrest_object`, so Terraform's
 	// prefix-before-first-underscore inference resolves the local name cleanly
 	// (the source address is still jamesonrgrieve/pfrest).
@@ -43,34 +43,30 @@ func (p *aosProvider) Metadata(_ context.Context, _ provider.MetadataRequest, re
 	resp.Version = p.version
 }
 
-func (p *aosProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
+func (p *pfrestProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Native provider for ArubaOS-Switch (AOS-S) switches (2530/2920/2930F, 16.x) " +
-			"via the REST API v8. Not for ArubaOS-CX — use aruba/aoscx for those.",
+		MarkdownDescription: "Native provider for pfSense via the REST API v2 " +
+			"(pfSense-pkg-RESTAPI / pfrest.org). Stateless `X-API-Key` auth.",
 		Attributes: map[string]schema.Attribute{
 			"host": schema.StringAttribute{
 				Required:            true,
-				MarkdownDescription: "Switch address (host or host:port), no scheme.",
+				MarkdownDescription: "pfSense address (host or host:port), no scheme.",
 			},
-			"username": schema.StringAttribute{
-				Required:            true,
-				MarkdownDescription: "AOS-S operator/manager username.",
-			},
-			"password": schema.StringAttribute{
+			"api_key": schema.StringAttribute{
 				Required:            true,
 				Sensitive:           true,
-				MarkdownDescription: "AOS-S password.",
+				MarkdownDescription: "pfSense REST API key, sent as the `X-API-Key` header on every request.",
 			},
 			"insecure": schema.BoolAttribute{
 				Optional: true,
-				MarkdownDescription: "Skip TLS verification (default true — AOS-S ships a self-signed cert). " +
+				MarkdownDescription: "Skip TLS verification (default true — pfSense ships a self-signed cert). " +
 					"Set false only with a trusted cert installed.",
 			},
 		},
 	}
 }
 
-func (p *aosProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
+func (p *pfrestProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
 	var cfg providerModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
 	if resp.Diagnostics.HasError() {
@@ -82,18 +78,17 @@ func (p *aosProvider) Configure(ctx context.Context, req provider.ConfigureReque
 	}
 	client := pfrest.NewClient(pfrest.Config{
 		Host:     cfg.Host.ValueString(),
-		Username: cfg.Username.ValueString(),
-		Password: cfg.Password.ValueString(),
+		APIKey:   cfg.APIKey.ValueString(),
 		Insecure: insecure,
 	})
 	resp.ResourceData = client
 	resp.DataSourceData = client
 }
 
-func (p *aosProvider) Resources(_ context.Context) []func() resource.Resource {
+func (p *pfrestProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{NewObjectResource}
 }
 
-func (p *aosProvider) DataSources(_ context.Context) []func() datasource.DataSource {
+func (p *pfrestProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{NewObjectDataSource}
 }
