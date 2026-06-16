@@ -58,10 +58,18 @@ func NewClient(c Config) *Client {
 		MaxIdleConns:    4,
 		IdleConnTimeout: 30 * time.Second,
 	}
-	host := strings.TrimSuffix(strings.TrimPrefix(c.Host, "https://"), "/")
-	host = strings.TrimPrefix(host, "http://")
+	// Scheme is taken from a `http://` / `https://` prefix on Host (default
+	// https). pfSense REST API is normally HTTPS on the webConfigurator port, but
+	// some deployments expose it over plain HTTP on a custom port (e.g.
+	// http://host:8080) — honour that instead of forcing https.
+	host := strings.TrimSuffix(c.Host, "/")
+	scheme := "https"
+	if strings.HasPrefix(host, "http://") {
+		scheme = "http"
+	}
+	host = strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://")
 	return &Client{
-		base:   fmt.Sprintf("https://%s/api/v2", host),
+		base:   fmt.Sprintf("%s://%s/api/v2", scheme, host),
 		apiKey: c.APIKey,
 		http:   &http.Client{Timeout: c.Timeout, Transport: tr},
 	}
