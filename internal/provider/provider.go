@@ -86,7 +86,7 @@ func (p *pfrestProvider) Configure(ctx context.Context, req provider.ConfigureRe
 }
 
 func (p *pfrestProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{NewObjectResource}
+	return []func() resource.Resource{NewObjectResource, NewReconcileResource}
 }
 
 func (p *pfrestProvider) DataSources(_ context.Context) []func() datasource.DataSource {
