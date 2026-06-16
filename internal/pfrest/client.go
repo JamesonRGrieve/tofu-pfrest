@@ -43,7 +43,11 @@ type Config struct {
 	// Insecure skips TLS verification (pfSense ships a self-signed cert; true is
 	// the norm on a lab / OOB management network).
 	Insecure bool
-	// Timeout per request (default 30s).
+	// Timeout per request (default 180s). pfSense REST reads on a
+	// pfBlockerNG-heavy box over a high-latency tunnel (e.g. omg over WireGuard)
+	// can take well over 30s for alias/nat/vlan/interface endpoints; a tight
+	// timeout fails those reads during import/refresh. 180s is generous headroom
+	// for adoption without hanging indefinitely.
 	Timeout time.Duration
 }
 
@@ -51,7 +55,7 @@ type Config struct {
 // call.
 func NewClient(c Config) *Client {
 	if c.Timeout == 0 {
-		c.Timeout = 30 * time.Second
+		c.Timeout = 180 * time.Second
 	}
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: c.Insecure}, //nolint:gosec // self-signed mgmt cert
