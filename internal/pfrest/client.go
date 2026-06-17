@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,9 +29,10 @@ import (
 // Client is freely shared across resources (the provider does) and is safe for
 // concurrent use (it holds no mutable per-request state).
 type Client struct {
-	base   string // e.g. https://192.168.7.x/api/v2
-	apiKey string
-	http   *http.Client
+	base    string // e.g. https://192.168.7.x/api/v2
+	apiKey  string
+	http    *http.Client
+	retries int
 }
 
 // Config configures a Client.
@@ -49,6 +51,16 @@ type Config struct {
 	// timeout fails those reads during import/refresh. 180s is generous headroom
 	// for adoption without hanging indefinitely.
 	Timeout time.Duration
+	// Retries is the number of ADDITIONAL attempts on a transient transport
+	// failure (dial/connect timeout, reset, EOF) or a 5xx, with exponential
+	// backoff. A flaky high-latency tunnel (omg over WireGuard) intermittently
+	// drops SYNs, so a single read can fail where a retry succeeds. Default 4.
+	Retries int
+	// DialTimeout bounds the TCP connect per attempt so a dropped-SYN connect
+	// fails fast (and is retried) instead of waiting out the OS SYN-retry budget
+	// (~130s). Default 30s — generous for a high-latency tunnel, well below the
+	// per-request Timeout.
+	DialTimeout time.Duration
 }
 
 // NewClient builds a Client. It does not contact pfSense until the first API
@@ -57,8 +69,18 @@ func NewClient(c Config) *Client {
 	if c.Timeout == 0 {
 		c.Timeout = 180 * time.Second
 	}
+	if c.Retries == 0 {
+		c.Retries = 4
+	}
+	if c.DialTimeout == 0 {
+		c.DialTimeout = 30 * time.Second
+	}
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: c.Insecure}, //nolint:gosec // self-signed mgmt cert
+		DialContext: (&net.Dialer{
+			Timeout:   c.DialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 		MaxIdleConns:    4,
 		IdleConnTimeout: 30 * time.Second,
 	}
@@ -73,10 +95,21 @@ func NewClient(c Config) *Client {
 	}
 	host = strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://")
 	return &Client{
-		base:   fmt.Sprintf("%s://%s/api/v2", scheme, host),
-		apiKey: c.APIKey,
-		http:   &http.Client{Timeout: c.Timeout, Transport: tr},
+		base:    fmt.Sprintf("%s://%s/api/v2", scheme, host),
+		apiKey:  c.APIKey,
+		http:    &http.Client{Timeout: c.Timeout, Transport: tr},
+		retries: c.Retries,
 	}
+}
+
+// backoff is the exponential delay before retry attempt N (0-based), capped at
+// 16s: 1s, 2s, 4s, 8s, 16s, 16s…
+func backoff(attempt int) time.Duration {
+	d := (time.Duration(1) << uint(attempt)) * time.Second
+	if d > 16*time.Second {
+		d = 16 * time.Second
+	}
+	return d
 }
 
 // APIError is returned when pfSense responds with a non-2xx status. Message is
@@ -127,40 +160,56 @@ func (c *Client) do(method, path string, query url.Values, body []byte) (*envelo
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	var rdr io.Reader
-	if body != nil {
-		rdr = bytes.NewReader(body)
-	}
-	req, err := http.NewRequest(method, u, rdr)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("X-API-Key", c.apiKey)
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("pfrest %s %s: %w", method, path, err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-
-	var env envelope
-	// The envelope is always JSON; tolerate a non-JSON body only to surface it
-	// in the error.
-	_ = json.Unmarshal(raw, &env)
-	if resp.StatusCode/100 != 2 {
-		return nil, &APIError{
-			Method:  method,
-			Path:    path,
-			Status:  resp.StatusCode,
-			Message: env.Message,
-			Body:    string(raw),
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		var rdr io.Reader
+		if body != nil {
+			rdr = bytes.NewReader(body)
 		}
+		req, err := http.NewRequest(method, u, rdr)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("X-API-Key", c.apiKey)
+		req.Header.Set("Accept", "application/json")
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			// Transport-level failure (dial/connect timeout, reset, EOF) — transient
+			// over a flaky high-latency tunnel; retry with backoff before giving up.
+			lastErr = fmt.Errorf("pfrest %s %s: %w", method, path, err)
+			if attempt < c.retries {
+				time.Sleep(backoff(attempt))
+				continue
+			}
+			return nil, lastErr
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		var env envelope
+		// The envelope is always JSON; tolerate a non-JSON body only to surface it
+		// in the error.
+		_ = json.Unmarshal(raw, &env)
+		if resp.StatusCode/100 != 2 {
+			apiErr := &APIError{
+				Method:  method,
+				Path:    path,
+				Status:  resp.StatusCode,
+				Message: env.Message,
+				Body:    string(raw),
+			}
+			// 5xx is transient (server busy / mid-filter-reload); 4xx is definitive.
+			if resp.StatusCode/100 == 5 && attempt < c.retries {
+				time.Sleep(backoff(attempt))
+				continue
+			}
+			return nil, apiErr
+		}
+		return &env, nil
 	}
-	return &env, nil
 }
 
 // Get fetches a resource. query carries the id for singular collection items
