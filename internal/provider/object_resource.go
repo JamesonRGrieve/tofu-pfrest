@@ -404,10 +404,14 @@ func (subsetSuppress) PlanModifyString(_ context.Context, req planmodifier.Strin
 	}
 }
 
-// subsetMatches reports whether every top-level key in the config JSON object
-// is present in the prior JSON object with a structurally-equal value (config
-// is a value-subset of prior). Invalid JSON on either side returns false so the
-// caller falls back to a normal diff.
+// subsetMatches reports whether the config JSON object is a recursive value-subset
+// of the prior JSON object: every config key must be present in prior, and nested
+// objects/arrays are matched with the SAME subset semantics. This lets a declared
+// array element that omits server-assigned metadata (e.g. a haproxy backend server
+// declaring only name/address/port while the device adds id/parent_id/weight/ssl)
+// still match its live counterpart and import to 0-diff. Arrays must have equal
+// length and match element-wise by index; scalars match structurally. Invalid JSON
+// on either side returns false so the caller falls back to a normal diff.
 func subsetMatches(prior, cfg string) bool {
 	var p, c map[string]json.RawMessage
 	if json.Unmarshal([]byte(prior), &p) != nil {
@@ -418,20 +422,54 @@ func subsetMatches(prior, cfg string) bool {
 	}
 	for k, cv := range c {
 		pv, ok := p[k]
-		if !ok || !jsonEqual(cv, pv) {
+		if !ok || !subsetRaw(cv, pv) {
 			return false
 		}
 	}
 	return true
 }
 
-// jsonEqual compares two raw JSON values structurally (order-insensitive).
-func jsonEqual(a, b json.RawMessage) bool {
-	var av, bv any
-	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+// subsetRaw decodes two raw JSON values and reports whether cfg is a recursive
+// value-subset of prior.
+func subsetRaw(cfg, prior json.RawMessage) bool {
+	var cv, pv any
+	if json.Unmarshal(cfg, &cv) != nil || json.Unmarshal(prior, &pv) != nil {
 		return false
 	}
-	return reflect.DeepEqual(av, bv)
+	return subsetValue(cv, pv)
+}
+
+// subsetValue reports whether the decoded config value is a recursive value-subset
+// of the decoded prior value. Objects: every cfg key must subset-match prior's.
+// Arrays: equal length, element-wise subset. Scalars: structural equality.
+func subsetValue(cfg, prior any) bool {
+	switch c := cfg.(type) {
+	case map[string]any:
+		p, ok := prior.(map[string]any)
+		if !ok {
+			return false
+		}
+		for k, cval := range c {
+			pval, ok := p[k]
+			if !ok || !subsetValue(cval, pval) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		p, ok := prior.([]any)
+		if !ok || len(p) != len(c) {
+			return false
+		}
+		for i := range c {
+			if !subsetValue(c[i], p[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(cfg, prior)
+	}
 }
 
 // compactJSON re-serializes raw JSON in compact, key-sorted-by-encoder form.

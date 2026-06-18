@@ -62,6 +62,36 @@ func TestSubsetMatches(t *testing.T) {
 			wantMatched: false,
 		},
 		{
+			name:        "nested object subset of prior object — match",
+			prior:       `{"dnsserver":{"v4":"1.1.1.1","v6":"::1","ttl":60}}`,
+			cfg:         `{"dnsserver":{"v4":"1.1.1.1"}}`,
+			wantMatched: true,
+		},
+		{
+			name:        "array-of-objects: declared server subset of live server (metadata) — match",
+			prior:       `{"name":"authentik","id":23,"servers":[{"name":"authentik","address":"192.168.1.8","port":"9000","status":"active","id":0,"parent_id":23,"ssl":false,"weight":1}]}`,
+			cfg:         `{"name":"authentik","servers":[{"name":"authentik","address":"192.168.1.8","port":"9000","status":"active"}]}`,
+			wantMatched: true,
+		},
+		{
+			name:        "array-of-objects: declared server field drift — no match",
+			prior:       `{"servers":[{"name":"authentik","address":"192.168.1.8","port":"9000","id":0}]}`,
+			cfg:         `{"servers":[{"name":"authentik","address":"192.168.1.8","port":"443"}]}`,
+			wantMatched: false,
+		},
+		{
+			name:        "array-of-objects: declared server missing on live — no match",
+			prior:       `{"servers":[{"name":"authentik","address":"192.168.1.8"}]}`,
+			cfg:         `{"servers":[{"name":"authentik","address":"192.168.1.8","port":"9000"}]}`,
+			wantMatched: false,
+		},
+		{
+			name:        "array length mismatch (server removed) — no match",
+			prior:       `{"servers":[{"name":"a"},{"name":"b"}]}`,
+			cfg:         `{"servers":[{"name":"a"}]}`,
+			wantMatched: false,
+		},
+		{
 			name:        "invalid prior JSON — no match (fall back to diff)",
 			prior:       `not json`,
 			cfg:         `{"a":1}`,
