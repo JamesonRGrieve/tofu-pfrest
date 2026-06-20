@@ -117,7 +117,7 @@ func (r *reconcileResource) reconcile(ctx context.Context, m reconcileModel, dia
 	}
 	// pfSense REST apply endpoints take no parameters; POST an empty JSON object.
 	warnings, allFailed := runReconcile(eps, func(p string) error {
-		_, err := r.client.Post(p, []byte("{}"))
+		_, err := r.client.Post(p, nil, []byte("{}"))
 		return err
 	})
 	for _, w := range warnings {

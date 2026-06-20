@@ -223,10 +223,13 @@ func (c *Client) Get(path string, query url.Values) (json.RawMessage, error) {
 	return env.Data, nil
 }
 
-// Post creates an object in a collection with the given JSON body. Returns the
-// raw `data` of the created object (which includes the server-assigned `id`).
-func (c *Client) Post(path string, body []byte) (json.RawMessage, error) {
-	env, err := c.do(http.MethodPost, path, nil, body)
+// Post creates an object in a collection with the given JSON body. query is
+// optional (nil for none) and carries request modifiers such as `apply=true`,
+// which commits + reloads the affected subsystem synchronously instead of
+// leaving the write pending. Returns the raw `data` of the created object (which
+// includes the server-assigned `id`).
+func (c *Client) Post(path string, query url.Values, body []byte) (json.RawMessage, error) {
+	env, err := c.do(http.MethodPost, path, query, body)
 	if err != nil {
 		return nil, err
 	}

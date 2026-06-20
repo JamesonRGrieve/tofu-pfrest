@@ -4,8 +4,39 @@ package provider
 
 import (
 	"encoding/json"
+	"net/url"
 	"testing"
 )
+
+func TestWithApply(t *testing.T) {
+	t.Run("apply=false leaves nil query nil", func(t *testing.T) {
+		if got := withApply(nil, false); got != nil {
+			t.Fatalf("withApply(nil,false) = %v, want nil", got)
+		}
+	})
+	t.Run("apply=true on nil query adds apply=true", func(t *testing.T) {
+		got := withApply(nil, true)
+		if got.Get("apply") != "true" {
+			t.Fatalf("withApply(nil,true).apply = %q, want true", got.Get("apply"))
+		}
+	})
+	t.Run("apply=true preserves existing id and adds apply", func(t *testing.T) {
+		got := withApply(url.Values{"id": []string{"7"}}, true)
+		if got.Get("id") != "7" {
+			t.Fatalf("id = %q, want 7", got.Get("id"))
+		}
+		if got.Get("apply") != "true" {
+			t.Fatalf("apply = %q, want true", got.Get("apply"))
+		}
+	})
+	t.Run("apply=false preserves existing id unchanged", func(t *testing.T) {
+		in := url.Values{"id": []string{"7"}}
+		got := withApply(in, false)
+		if got.Get("id") != "7" || got.Has("apply") {
+			t.Fatalf("withApply(id=7,false) = %v, want id=7 and no apply", got)
+		}
+	})
+}
 
 func TestSubsetMatches(t *testing.T) {
 	cases := []struct {

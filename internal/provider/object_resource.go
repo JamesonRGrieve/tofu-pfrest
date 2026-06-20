@@ -40,6 +40,7 @@ type objectModel struct {
 	Singleton types.Bool   `tfsdk:"singleton"`
 	ObjectID  types.String `tfsdk:"object_id"`
 	Body      types.String `tfsdk:"body"`
+	Apply     types.Bool   `tfsdk:"apply"`
 }
 
 func (r *objectResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -87,8 +88,38 @@ func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"device object; drift is detected only on these keys.",
 				PlanModifiers: []planmodifier.String{subsetSuppress{}},
 			},
+			"apply": schema.BoolAttribute{
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "Send `?apply=true` on every write (create/update/delete) so pfSense commits " +
+					"the change AND reloads the affected subsystem synchronously, instead of leaving it staged as a " +
+					"pending change. REQUIRED for object types whose writes are otherwise not persisted/listed until " +
+					"applied (e.g. `routing/gateway`), and it makes the server-assigned `id` reflect the committed " +
+					"array position. Default `false` (write only — pair with a separate `pfrest_reconcile` apply). " +
+					"Set `true` ONLY for state-preserving applies (firewall filter, NAT, routing, DNS); NEVER for " +
+					"interface/VLAN/WireGuard/IPsec writes, whose apply bounces the management path.",
+				Default: booldefault.StaticBool(false),
+			},
 		},
 	}
+}
+
+// applyOn reports whether this object should send `?apply=true` on writes.
+func (r *objectResource) applyOn(m objectModel) bool {
+	return !m.Apply.IsNull() && !m.Apply.IsUnknown() && m.Apply.ValueBool()
+}
+
+// withApply returns q (creating it if nil) with `apply=true` added when apply is
+// set; otherwise q unchanged. pfSense reads the flag from the query string.
+func withApply(q url.Values, apply bool) url.Values {
+	if !apply {
+		return q
+	}
+	if q == nil {
+		q = url.Values{}
+	}
+	q.Set("apply", "true")
+	return q
 }
 
 func (r *objectResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
@@ -164,10 +195,12 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 	}
 	endpoint := normPath(m.Endpoint.ValueString())
 
+	apply := r.applyOn(m)
+
 	if r.isSingleton(m) {
 		// Singleton: there is nothing to create — PATCH the endpoint into the
 		// declared shape. The endpoint is the id; no object_id.
-		if _, err := r.client.Patch(endpoint, nil, body); err != nil {
+		if _, err := r.client.Patch(endpoint, withApply(nil, apply), body); err != nil {
 			resp.Diagnostics.AddError("pfrest create (singleton PATCH) failed", err.Error())
 			return
 		}
@@ -179,7 +212,7 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 
 	// Collection: POST creates the object and the server assigns the id, which
 	// it returns in data.id.
-	data, err := r.client.Post(endpoint, body)
+	data, err := r.client.Post(endpoint, withApply(nil, apply), body)
 	if err != nil {
 		resp.Diagnostics.AddError("pfrest create (POST) failed", err.Error())
 		return
@@ -254,9 +287,10 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 	endpoint := normPath(m.Endpoint.ValueString())
+	apply := r.applyOn(m)
 
 	if r.isSingleton(m) {
-		if _, err := r.client.Patch(endpoint, nil, body); err != nil {
+		if _, err := r.client.Patch(endpoint, withApply(nil, apply), body); err != nil {
 			resp.Diagnostics.AddError("pfrest update (singleton PATCH) failed", err.Error())
 			return
 		}
@@ -274,7 +308,7 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 		resp.Diagnostics.AddError("pfrest update: cannot inject id", err.Error())
 		return
 	}
-	if _, err := r.client.Patch(endpoint, idQuery(id), patchBody); err != nil {
+	if _, err := r.client.Patch(endpoint, withApply(idQuery(id), apply), patchBody); err != nil {
 		resp.Diagnostics.AddError("pfrest update (PATCH) failed", err.Error())
 		return
 	}
@@ -293,7 +327,7 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		return
 	}
 	endpoint := normPath(m.Endpoint.ValueString())
-	if _, err := r.client.Delete(endpoint, idQuery(m.ObjectID.ValueString())); err != nil {
+	if _, err := r.client.Delete(endpoint, withApply(idQuery(m.ObjectID.ValueString()), r.applyOn(m))); err != nil {
 		if pfrest.NotFound(err) {
 			return // already gone
 		}
