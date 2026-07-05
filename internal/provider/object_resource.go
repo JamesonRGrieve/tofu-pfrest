@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -95,10 +96,16 @@ func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"the change AND reloads the affected subsystem synchronously, instead of leaving it staged as a " +
 					"pending change. REQUIRED for object types whose writes are otherwise not persisted/listed until " +
 					"applied (e.g. `routing/gateway`), and it makes the server-assigned `id` reflect the committed " +
-					"array position. Default `false` (write only — pair with a separate `pfrest_reconcile` apply). " +
+					"array position. Unset ⇒ treated as false (write only — pair with a separate `pfrest_reconcile` apply). " +
 					"Set `true` ONLY for state-preserving applies (firewall filter, NAT, routing, DNS); NEVER for " +
 					"interface/VLAN/WireGuard/IPsec writes, whose apply bounces the management path.",
-				Default: booldefault.StaticBool(false),
+				// No StaticBool default: a default would rewrite an imported resource's
+				// null `apply` to `false` at plan time, churning EVERY adopted object
+				// (null->false) and — under subsetSuppress — re-PATCHing its full body to
+				// the live device. UseStateForUnknown instead mirrors prior state when the
+				// attribute is unset, so an imported null stays null (0-diff) while an
+				// explicit config value is still honored. applyOn() reads null as false.
+				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
 			},
 		},
 	}
@@ -288,6 +295,29 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 	}
 	endpoint := normPath(m.Endpoint.ValueString())
 	apply := r.applyOn(m)
+
+	// No-op write guard. `body` is dual-purpose: it is both the drift-detection
+	// state (the full device object, kept by the subsetSuppress plan modifier so a
+	// subset declaration adopts at 0-diff) AND the wire PATCH payload. When the
+	// declared body is unchanged from prior state, an Update can still be triggered
+	// purely by a computed-attribute churn (notably `apply` going null->false on the
+	// first apply after an import). Re-PATCHing the unchanged (full) object is a
+	// no-op on the device EXCEPT that RESTAPI >= 2.8.2 re-validates the whole object
+	// and REJECTS legacy/immutable nested fields it would accept at rest — e.g. a
+	// haproxy frontend's interface-symbol `a_extaddr` binds (wan_ipv4/opt1_ipv4)
+	// 400 with "extaddr must be one of [custom,...]". Since there is nothing to
+	// write, skip the PATCH; a same-body write's only other effect is the optional
+	// apply/reload, which is unnecessary when the config did not change (a standalone
+	// reload is `pfrest_reconcile`'s job). This keeps 0-diff adoption truly no-op.
+	if m.Body.ValueString() == prior.Body.ValueString() {
+		if r.isSingleton(m) {
+			m.ID = m.Endpoint
+		} else {
+			m.ID = types.StringValue(m.Endpoint.ValueString() + "|" + m.ObjectID.ValueString())
+		}
+		resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+		return
+	}
 
 	if r.isSingleton(m) {
 		if _, err := r.client.Patch(endpoint, withApply(nil, apply), body); err != nil {
