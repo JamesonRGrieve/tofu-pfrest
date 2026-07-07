@@ -5,6 +5,7 @@ package provider
 import (
 	"encoding/json"
 	"net/url"
+	"sort"
 	"testing"
 )
 
@@ -38,103 +39,96 @@ func TestWithApply(t *testing.T) {
 	})
 }
 
-func TestSubsetMatches(t *testing.T) {
+func sortedKeys(m map[string]string) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// reconcileBody produces the planned body: EXACTLY the declared (config) keys
+// (a NestedType map's planned key set must equal config's — unmanaged keys are
+// dropped, and kept out of state by Read's projection). For each declared key it
+// keeps the prior value on a recursive value-subset match (0-diff, incl. a thin
+// array element that omits server metadata), else takes config. Each planned[k]
+// is config[k] or prior[k] — legal per element for a NestedType map.
+func TestReconcileBody(t *testing.T) {
 	cases := []struct {
-		name        string
-		prior, cfg  string
-		wantMatched bool
+		name       string
+		prior, cfg map[string]string
+		want       map[string]string
 	}{
 		{
-			name:        "config subset of full device object — match (0-diff)",
-			prior:       `{"id":3,"name":"web_servers","type":"host","descr":"","address":["10.0.0.1"]}`,
-			cfg:         `{"name":"web_servers","type":"host","address":["10.0.0.1"]}`,
-			wantMatched: true,
+			name:  "config subset — declared keys keep prior; unmanaged NOT in result (dropped)",
+			prior: map[string]string{"id": `3`, "name": `"web"`, "descr": `"edge"`, "address": `["10.0.0.1"]`},
+			cfg:   map[string]string{"name": `"web"`, "address": `["10.0.0.1"]`},
+			want:  map[string]string{"name": `"web"`, "address": `["10.0.0.1"]`},
 		},
 		{
-			name:        "declared key drifted — no match (update)",
-			prior:       `{"id":3,"name":"web_servers_OLD","type":"host"}`,
-			cfg:         `{"name":"web_servers","type":"host"}`,
-			wantMatched: false,
+			name:  "declared scalar changed — that key takes config; only declared keys present",
+			prior: map[string]string{"id": `0`, "name": `"fe"`, "a_extaddr": `[{"extaddr":"wan_ipv4"}]`},
+			cfg:   map[string]string{"name": `"fe2"`},
+			want:  map[string]string{"name": `"fe2"`},
 		},
 		{
-			name:        "declared key missing on device — no match",
-			prior:       `{"id":3,"type":"host"}`,
-			cfg:         `{"name":"web_servers","type":"host"}`,
-			wantMatched: false,
+			name:  "thin declared server subset of live (server metadata) — key kept at prior full value",
+			prior: map[string]string{"name": `"p"`, "servers": `[{"name":"s","address":"1.1.1.1","port":"80","id":0,"weight":1}]`},
+			cfg:   map[string]string{"name": `"p"`, "servers": `[{"name":"s","address":"1.1.1.1","port":"80"}]`},
+			want:  map[string]string{"name": `"p"`, "servers": `[{"name":"s","address":"1.1.1.1","port":"80","id":0,"weight":1}]`},
 		},
 		{
-			name:        "key order / whitespace insensitive — match",
-			prior:       `{"name":"web_servers","type":"host"}`,
-			cfg:         "{\n  \"type\": \"host\",\n  \"name\": \"web_servers\"\n}",
-			wantMatched: true,
+			name:  "declared array grows — that key takes config (only declared keys present)",
+			prior: map[string]string{"id": `0`, "ha_acls": `[{"name":"a"}]`, "a_extaddr": `[{"extaddr":"wan_ipv4"}]`},
+			cfg:   map[string]string{"ha_acls": `[{"name":"a"},{"name":"b"}]`},
+			want:  map[string]string{"ha_acls": `[{"name":"a"},{"name":"b"}]`},
 		},
 		{
-			name:        "nested object value compared structurally — match",
-			prior:       `{"dnsserver":{"v4":"1.1.1.1","v6":"::1"},"id":0}`,
-			cfg:         `{"dnsserver":{"v6":"::1","v4":"1.1.1.1"}}`,
-			wantMatched: true,
-		},
-		{
-			name:        "nested object value drift — no match",
-			prior:       `{"dnsserver":{"v4":"1.1.1.1"}}`,
-			cfg:         `{"dnsserver":{"v4":"8.8.8.8"}}`,
-			wantMatched: false,
-		},
-		{
-			name:        "list value compared in order — match",
-			prior:       `{"address":["10.0.0.1","10.0.0.2"],"id":1}`,
-			cfg:         `{"address":["10.0.0.1","10.0.0.2"]}`,
-			wantMatched: true,
-		},
-		{
-			name:        "list order drift — no match",
-			prior:       `{"address":["10.0.0.2","10.0.0.1"]}`,
-			cfg:         `{"address":["10.0.0.1","10.0.0.2"]}`,
-			wantMatched: false,
-		},
-		{
-			name:        "nested object subset of prior object — match",
-			prior:       `{"dnsserver":{"v4":"1.1.1.1","v6":"::1","ttl":60}}`,
-			cfg:         `{"dnsserver":{"v4":"1.1.1.1"}}`,
-			wantMatched: true,
-		},
-		{
-			name:        "array-of-objects: declared server subset of live server (metadata) — match",
-			prior:       `{"name":"authentik","id":23,"servers":[{"name":"authentik","address":"192.168.1.8","port":"9000","status":"active","id":0,"parent_id":23,"ssl":false,"weight":1}]}`,
-			cfg:         `{"name":"authentik","servers":[{"name":"authentik","address":"192.168.1.8","port":"9000","status":"active"}]}`,
-			wantMatched: true,
-		},
-		{
-			name:        "array-of-objects: declared server field drift — no match",
-			prior:       `{"servers":[{"name":"authentik","address":"192.168.1.8","port":"9000","id":0}]}`,
-			cfg:         `{"servers":[{"name":"authentik","address":"192.168.1.8","port":"443"}]}`,
-			wantMatched: false,
-		},
-		{
-			name:        "array-of-objects: declared server missing on live — no match",
-			prior:       `{"servers":[{"name":"authentik","address":"192.168.1.8"}]}`,
-			cfg:         `{"servers":[{"name":"authentik","address":"192.168.1.8","port":"9000"}]}`,
-			wantMatched: false,
-		},
-		{
-			name:        "array length mismatch (server removed) — no match",
-			prior:       `{"servers":[{"name":"a"},{"name":"b"}]}`,
-			cfg:         `{"servers":[{"name":"a"}]}`,
-			wantMatched: false,
-		},
-		{
-			name:        "invalid prior JSON — no match (fall back to diff)",
-			prior:       `not json`,
-			cfg:         `{"a":1}`,
-			wantMatched: false,
+			name:  "newly declared key not on device — taken from config",
+			prior: map[string]string{"name": `"p"`},
+			cfg:   map[string]string{"name": `"p"`, "descr": `"added"`},
+			want:  map[string]string{"name": `"p"`, "descr": `"added"`},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := subsetMatches(tc.prior, tc.cfg); got != tc.wantMatched {
-				t.Fatalf("subsetMatches() = %v, want %v", got, tc.wantMatched)
+			got := reconcileBody(tc.prior, tc.cfg)
+			if len(got) != len(tc.want) {
+				t.Fatalf("reconcileBody() keys=%v, want=%v", sortedKeys(got), sortedKeys(tc.want))
+			}
+			for k, wv := range tc.want {
+				gv, ok := got[k]
+				if !ok || !jsonEqual(json.RawMessage(gv), json.RawMessage(wv)) {
+					t.Fatalf("reconcileBody()[%q] = %q, want %q", k, gv, wv)
+				}
 			}
 		})
+	}
+}
+
+// objectToBody splits a full object into per-key JSON fragments; bodyToJSON
+// reassembles them type-exactly. The round-trip must be structurally identical.
+func TestObjectBodyRoundTrip(t *testing.T) {
+	full := `{"name":"web","enabled":"1","weight":5,"active":true,"servers":[{"name":"s","port":"80"}]}`
+	bm, err := objectToBody([]byte(full))
+	if err != nil {
+		t.Fatalf("objectToBody: %v", err)
+	}
+	for k, want := range map[string]string{"name": `"web"`, "enabled": `"1"`, "weight": `5`, "active": `true`} {
+		if !jsonEqual(json.RawMessage(bm[k]), json.RawMessage(want)) {
+			t.Fatalf("objectToBody[%q] = %q, want %q", k, bm[k], want)
+		}
+	}
+	out, err := bodyToJSON(bm)
+	if err != nil {
+		t.Fatalf("bodyToJSON: %v", err)
+	}
+	if !jsonEqual(json.RawMessage(out), json.RawMessage(full)) {
+		t.Fatalf("round-trip mismatch:\n got  %s\n want %s", out, full)
+	}
+	if _, err := bodyToJSON(map[string]string{"bad": `not-json`}); err == nil {
+		t.Fatalf("bodyToJSON should reject a non-JSON value")
 	}
 }
 
