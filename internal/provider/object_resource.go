@@ -145,6 +145,20 @@ func (r *objectResource) applyOn(m objectModel) bool {
 	return !m.Apply.IsNull() && !m.Apply.IsUnknown() && m.Apply.ValueBool()
 }
 
+// resolveApply is the value to persist for the Optional+Computed `apply` attribute
+// after a write. The result of an apply must EQUAL the plan when the plan is known,
+// but a Computed attribute planned as UNKNOWN may be resolved to any known value.
+// So: resolve an unknown plan (a create with `apply` unset) to the effective bool,
+// and echo a known plan (null when unset on update, or an explicit bool) unchanged.
+// Getting either half wrong taints the resource ("unknown value ... after apply")
+// or errors ("inconsistent result after apply: .apply was null, but now cty.False").
+func resolveApply(planned types.Bool, apply bool) types.Bool {
+	if planned.IsUnknown() {
+		return types.BoolValue(apply)
+	}
+	return planned
+}
+
 // withApply returns q (creating it if nil) with `apply=true` added when apply is
 // set; otherwise q unchanged. pfSense reads the flag from the query string.
 func withApply(q url.Values, apply bool) url.Values {
@@ -311,12 +325,14 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 	endpoint := normPath(m.Endpoint.ValueString())
 
 	apply := r.applyOn(m)
-	// `apply` is Optional+Computed: when the config omits it the planned value is
-	// UNKNOWN, and leaving it unknown in the result makes Terraform reject the apply
-	// ("Provider returned invalid result object after apply ... unknown value for
-	// .apply") and TAINT the resource. Persist the resolved bool so state always holds
-	// a known value. (Writes that set apply=true in config happened to dodge this.)
-	m.Apply = types.BoolValue(apply)
+	// `apply` is Optional+Computed. Resolve it to a known value ONLY when the planned
+	// value is UNKNOWN (a create with `apply` unset: the framework plans it unknown,
+	// and leaving it unknown in the result taints the resource — "unknown value for
+	// .apply after apply"). When the plan already carries a KNOWN value (null when
+	// unset on an update, or an explicit bool), echo it unchanged: the result must
+	// EQUAL the plan, so forcing false over a planned null triggers "inconsistent
+	// result after apply: .apply was null, but now cty.False".
+	m.Apply = resolveApply(m.Apply, apply)
 
 	if r.isSingleton(m) {
 		// Singleton: there is nothing to create — PATCH the endpoint into the
@@ -434,9 +450,7 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 	}
 	endpoint := normPath(m.Endpoint.ValueString())
 	apply := r.applyOn(m)
-	// Persist the resolved apply bool so the Computed attribute is never left unknown
-	// in the result (see Create — an unknown value taints the resource).
-	m.Apply = types.BoolValue(apply)
+	m.Apply = resolveApply(m.Apply, apply)
 
 	// The wire PATCH carries ONLY the managed keys whose value changed vs prior (or
 	// are newly declared), so unchanged fields are never re-sent. This matters

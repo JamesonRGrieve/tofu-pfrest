@@ -34,11 +34,36 @@ func TestApplyOn(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("applyOn(%v) = %v, want %v", tc.apply, got, tc.want)
 			}
-			// The value the fix writes back into state must be known, never
-			// null/unknown — that is what prevents the post-apply taint.
-			nv := types.BoolValue(got)
-			if nv.IsUnknown() || nv.IsNull() {
-				t.Fatalf("normalized apply must be a known bool, got %v", nv)
+		})
+	}
+}
+
+// resolveApply must resolve an UNKNOWN plan (create with apply unset) to a known
+// bool — else the result taints ("unknown value for .apply after apply") — while
+// echoing a KNOWN plan (null on an update, or an explicit bool) unchanged, since the
+// apply result must equal a known plan ("inconsistent result: .apply was null, but
+// now cty.False"). Both halves are load-bearing; each caused a real apply failure.
+func TestResolveApply(t *testing.T) {
+	cases := []struct {
+		name    string
+		planned types.Bool
+		apply   bool
+		want    types.Bool
+	}{
+		{name: "unknown plan (create, unset) → resolved false", planned: types.BoolUnknown(), apply: false, want: types.BoolValue(false)},
+		{name: "unknown plan (create, apply=true resolved) → true", planned: types.BoolUnknown(), apply: true, want: types.BoolValue(true)},
+		{name: "known null plan (update, unset) → echo null", planned: types.BoolNull(), apply: false, want: types.BoolNull()},
+		{name: "known false plan → echo false", planned: types.BoolValue(false), apply: true, want: types.BoolValue(false)},
+		{name: "known true plan → echo true", planned: types.BoolValue(true), apply: false, want: types.BoolValue(true)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveApply(tc.planned, tc.apply)
+			if !got.Equal(tc.want) {
+				t.Fatalf("resolveApply(%v, %v) = %v, want %v", tc.planned, tc.apply, got, tc.want)
+			}
+			if got.IsUnknown() {
+				t.Fatalf("resolveApply must never return unknown, got %v", got)
 			}
 		})
 	}
