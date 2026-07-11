@@ -7,7 +7,42 @@ import (
 	"net/url"
 	"sort"
 	"testing"
+
+	"github.com/hashicorp/terraform-plugin-framework/types"
 )
+
+// applyOn resolves the Optional+Computed `apply` bool to a concrete value for any
+// input state (null when unset in config, unknown while computed pre-apply). Create/
+// Update persist types.BoolValue(applyOn(m)) into state, so the result must ALWAYS be
+// a known bool — an unknown left in the result taints the resource ("Provider
+// returned invalid result object after apply ... unknown value for .apply").
+func TestApplyOn(t *testing.T) {
+	r := &objectResource{}
+	cases := []struct {
+		name  string
+		apply types.Bool
+		want  bool
+	}{
+		{name: "null (apply unset in config)", apply: types.BoolNull(), want: false},
+		{name: "unknown (computed, pre-apply)", apply: types.BoolUnknown(), want: false},
+		{name: "explicit false", apply: types.BoolValue(false), want: false},
+		{name: "explicit true", apply: types.BoolValue(true), want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := r.applyOn(objectModel{Apply: tc.apply})
+			if got != tc.want {
+				t.Fatalf("applyOn(%v) = %v, want %v", tc.apply, got, tc.want)
+			}
+			// The value the fix writes back into state must be known, never
+			// null/unknown — that is what prevents the post-apply taint.
+			nv := types.BoolValue(got)
+			if nv.IsUnknown() || nv.IsNull() {
+				t.Fatalf("normalized apply must be a known bool, got %v", nv)
+			}
+		})
+	}
+}
 
 func TestWithApply(t *testing.T) {
 	t.Run("apply=false leaves nil query nil", func(t *testing.T) {

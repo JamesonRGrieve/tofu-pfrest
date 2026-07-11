@@ -311,6 +311,12 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 	endpoint := normPath(m.Endpoint.ValueString())
 
 	apply := r.applyOn(m)
+	// `apply` is Optional+Computed: when the config omits it the planned value is
+	// UNKNOWN, and leaving it unknown in the result makes Terraform reject the apply
+	// ("Provider returned invalid result object after apply ... unknown value for
+	// .apply") and TAINT the resource. Persist the resolved bool so state always holds
+	// a known value. (Writes that set apply=true in config happened to dodge this.)
+	m.Apply = types.BoolValue(apply)
 
 	if r.isSingleton(m) {
 		// Singleton: there is nothing to create — PATCH the endpoint into the
@@ -428,6 +434,9 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 	}
 	endpoint := normPath(m.Endpoint.ValueString())
 	apply := r.applyOn(m)
+	// Persist the resolved apply bool so the Computed attribute is never left unknown
+	// in the result (see Create — an unknown value taints the resource).
+	m.Apply = types.BoolValue(apply)
 
 	// The wire PATCH carries ONLY the managed keys whose value changed vs prior (or
 	// are newly declared), so unchanged fields are never re-sent. This matters
